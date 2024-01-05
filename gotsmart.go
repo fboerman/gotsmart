@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -86,46 +88,63 @@ func main() {
 		baudFlag   = flag.Int("baud", 115200, "Baud rate (speed) to use.")
 		bitsFlag   = flag.Int("bits", 8, "Number of databits.")
 		parityFlag = flag.String("parity", "none", "Parity the use (none/odd/even/mark/space).")
+
+		inputFlag   = flag.String("input-type", "serial", "Which input type to use (serial/tcp)")
+		tcpAddrFlag = flag.String("tcp-addr", "", "The address to connect to for tcp input")
 	)
 	flag.Parse()
 
 	fmt.Printf("GotSmart (%s)\n", version)
 
-	var parity serial.Parity
-	switch *parityFlag {
-	case "none":
-		parity = serial.ParityNone
-	case "odd":
-		parity = serial.ParityOdd
-	case "even":
-		parity = serial.ParityEven
-	case "mark":
-		parity = serial.ParityMark
-	case "space":
-		parity = serial.ParitySpace
-	default:
-		log.Fatal("Invalid parity setting")
+	var conn io.Reader
+	var err error
+	if *inputFlag == "serial" {
+		var parity serial.Parity
+		switch *parityFlag {
+		case "none":
+			parity = serial.ParityNone
+		case "odd":
+			parity = serial.ParityOdd
+		case "even":
+			parity = serial.ParityEven
+		case "mark":
+			parity = serial.ParityMark
+		case "space":
+			parity = serial.ParitySpace
+		default:
+			log.Fatal("Invalid parity setting")
+		}
+
+		c := &serial.Config{
+			Name:   *deviceFlag,
+			Baud:   *baudFlag,
+			Size:   byte(*bitsFlag),
+			Parity: parity,
+		}
+		conn, err = serial.OpenPort(c)
+	} else if *inputFlag == "tcp" {
+		if *tcpAddrFlag == "" {
+			log.Fatal("please specify a tcp connection string in format ip:port")
+		}
+		conn, err = net.Dial("tcp", *tcpAddrFlag)
+	} else {
+		log.Fatal("Invalid input type setting")
 	}
 
-	c := &serial.Config{
-		Name:   *deviceFlag,
-		Baud:   *baudFlag,
-		Size:   byte(*bitsFlag),
-		Parity: parity,
-	}
-	p, err := serial.OpenPort(c)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	br := bufio.NewReader(p)
+	br := bufio.NewReader(conn)
 	collector := &dsmrprometheus.DSMRCollector{}
-	prometheus.MustRegister(collector)
+	prom := prometheus.NewRegistry()
+	prom.MustRegister(collector)
+	promHttpHandler := promhttp.HandlerFor(prom, promhttp.HandlerOpts{})
 	f := &frameupdate{mutex: sync.Mutex{}}
 	go f.Process(br, collector)
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promHttpHandler)
 	mux.Handle("/", f)
 	srv := &http.Server{
 		Addr:         *addrFlag,
